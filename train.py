@@ -54,85 +54,93 @@ batch_size= 128
 train_dataloader = get_dataloader(df_train, batch_size, True)
 val_dataloader = get_dataloader(df_val, batch_size, True)
 test_dataloader = get_dataloader(df_test, batch_size)
-
-
-def train_model(trial, train_loader, val_loader, device):
-
+def train_model(trial, train_loader, val_loader, device="cpu"):
     hidden_size = trial.suggest_int("hidden_size", 32, 128)
     num_layers = trial.suggest_int("num_layers", 1, 3)
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-
-    model = LSTM(input_size=1, hidden_size=hidden_size, num_layers=num_layers, bias=True, output_size=4)
+    
+    model = LSTM(input_size=40, hidden_size=hidden_size, num_layers=num_layers, bias=True, output_size=4).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=10)
 
-    for epoch in range(20):  
+    patience = 5  
+    trial_loss = float("inf")
+    trial_acc = 0
+    best_model_state = None
+    epochs_no_improve = 0
+
+    for epoch in range(30): 
         model.train()
         for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch, y_batch
-            X_batch = X_batch.float().unsqueeze(-1)
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            X_batch = X_batch.float().unsqueeze(1)
             y_batch = y_batch.long()
+
             optimizer.zero_grad()
             outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
+        
         scheduler.step()
 
-    model.eval()
-    y_preds, y_true = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            X_batch, y_batch = X_batch, y_batch
-            X_batch = X_batch.float().unsqueeze(-1)
-            y_batch = y_batch.long()            
-            preds = model(X_batch).argmax(dim=1)
-            y_preds.extend(preds)
-            y_true.extend(y_batch)
-    return accuracy_score(y_true, y_preds)
+        model.eval()
+        val_loss = 0
+        y_preds, y_true = [], []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                X_batch = X_batch.float().unsqueeze(1)
+                y_batch = y_batch.long()
+                
+                preds = model(X_batch)
+                loss = criterion(preds, y_batch)
+                val_loss += loss.item()
+                
+                y_preds.extend(preds.argmax(dim=1).cpu().numpy())
+                y_true.extend(y_batch.cpu().numpy())
 
-def evaluate(param, name_model, train_loader, test_loader, device="cpu"):
-  model = LSTM(input_size=1, hidden_size=param["hidden_size"], num_layers=param["num_layers"], bias=True, output_size=4)
-  criterion = nn.CrossEntropyLoss()
-  optimizer = optim.Adam(model.parameters(), lr=param["lr"])
-  scheduler = CosineAnnealingLR(optimizer, T_max=10)
+        val_loss /= len(val_loader)
+        acc = accuracy_score(y_true, y_preds)
+
+        if val_loss < trial_loss:
+            trial_loss = val_loss
+            trial_acc = acc
+            best_model_state = model.state_dict()
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    if best_model_state:
+        torch.save(best_model_state, f"parameters/best_model_{hidden_size}_{num_layers}_{lr}.pth")
+
+    return trial_acc
 
 
-  for epoch in range(30):  
-      for X_batch, y_batch in train_loader:
-          X_batch, y_batch = X_batch, y_batch
-          X_batch = X_batch.float().unsqueeze(-1)
-          y_batch = y_batch.long()
-          optimizer.zero_grad()
-          outputs = model(X_batch)
-          loss = criterion(outputs, y_batch)
-          loss.backward()
-          optimizer.step()
-      scheduler.step()
+def evaluate(param, name_model, test_loader, device="cpu"):
+  model = LSTM(input_size=40, hidden_size=param["hidden_size"], num_layers=param["num_layers"], bias=True, output_size=4)
+  model.load_state_dict(torch.load(f"parameters/best_model_{param["hidden_size"]}_{param["num_layers"]}_{param["lr"]}.pth"))
   model.eval()
   y_preds, y_true = [], []
   with torch.no_grad():
     for X_batch, y_batch in test_loader:
         X_batch, y_batch = X_batch, y_batch
-        X_batch = X_batch.float().unsqueeze(-1)
+        X_batch = X_batch.float().unsqueeze(1)
         y_batch = y_batch.long()            
         preds = model(X_batch).argmax(dim=1)
         y_preds.extend(preds)
         y_true.extend(y_batch)
-    cm = confusion_matrix(y_true.data, y_preds.cpu())
-    # print(pred)
+    cm = confusion_matrix(y_true, y_preds)
     ConfusionMatrixDisplay(cm).plot()
     print("Accuracy: ", accuracy_score(y_true, y_preds))
-  joblib.dump(model, f'lstm.pkl')
 
-model = LSTM(input_size=1, hidden_size=256, num_layers=4,bias=True, output_size=4)
-criterion = nn.CrossEntropyLoss()
 
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-n_epochs =30
 study = optuna.create_study(direction="maximize")
-study.optimize(lambda trial: train_model(trial, train_dataloader, val_dataloader, device="cpu"), n_trials=10)
+study.optimize(lambda trial: train_model(trial, train_dataloader, val_dataloader, device="cpu"), n_trials=2)
 
 print("Best Hyperparameters:", study.best_params)
-evaluate(model, 'lstm', train_dataloader, test_dataloader)
+evaluate(study.best_params, 'lstm', test_dataloader)
