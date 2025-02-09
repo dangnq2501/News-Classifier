@@ -1,5 +1,5 @@
 from transformers import AutoTokenizer, AutoModel
-from model import LSTM, GRU
+from model import LSTM, GRU, BERTClassifier
 import pandas as pd
 import joblib
 from sklearn.model_selection import GridSearchCV
@@ -12,7 +12,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import optuna
 
 tokenizer = AutoTokenizer.from_pretrained("./local_directory/")
-model = AutoModel.from_pretrained("./local_directory/")
 def get_embed(x):
     return tokenizer.encode(x, padding="max_length", max_length=40, truncation=True)
 def len_embed(x):
@@ -58,10 +57,10 @@ class CustomDataset(Dataset):
         return {
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
-            "label": torch.tensor(label, dtype=torch.long)
+            "labels": torch.tensor(label, dtype=torch.long)
         }
 def get_dataloader(df, batch_size=64, shuffle=False):
-   dataset = TensorDataset(torch.tensor(df["Embed"]), torch.tensor(df["Label"]))
+   dataset = CustomDataset(df["Title"].tolist(), df["Label"].tolist(), tokenizer)
    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 # print(df_train.columns)
 # X_train, y_train = df_train["Title"], df_train["Category"]
@@ -69,12 +68,13 @@ batch_size= 256
 train_dataloader = get_dataloader(df_train, batch_size, True)
 val_dataloader = get_dataloader(df_val, batch_size)
 test_dataloader = get_dataloader(df_test, batch_size)
+
 def train_model(trial, train_loader, val_loader, device="cpu"):
-    hidden_size = trial.suggest_int("hidden_size", 32, 1024)
-    num_layers = trial.suggest_int("num_layers", 1, 10)
+    hidden_size = trial.suggest_int("hidden_size", 32, 128)
+    dropout = trial.suggest_float("dropout", 0.1, 0.6, log=True)
     lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
     
-    model = GRU(input_size =40, hidden_size=hidden_size, output_size=4, num_layers=num_layers, bias=True)
+    model = BERTClassifier(hidden_size=hidden_size, dropout=dropout)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=10)
@@ -85,16 +85,14 @@ def train_model(trial, train_loader, val_loader, device="cpu"):
     best_model_state = None
     epochs_no_improve = 0
 
-    for epoch in range(50): 
+    for epoch in range(20): 
         model.train()
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            X_batch = X_batch.float().unsqueeze(1)
-            y_batch = y_batch.long()
-
+        for data in train_loader:
+          
+            input_ids, attention_mask, labels = data["input_ids"], data["attention_mask"], data["labels"]
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            outputs = model(input_ids, attention_mask)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
         
@@ -104,17 +102,15 @@ def train_model(trial, train_loader, val_loader, device="cpu"):
         val_loss = 0
         y_preds, y_true = [], []
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                X_batch = X_batch.float().unsqueeze(1)
-                y_batch = y_batch.long()
+            for data in val_loader:
+                input_ids, attention_mask, labels = data["input_ids"], data["attention_mask"], data["labels"]
                 
-                preds = model(X_batch)
-                loss = criterion(preds, y_batch)
+                preds = model(input_ids, attention_mask)
+                loss = criterion(preds, labels)
                 val_loss += loss.item()
                 
                 y_preds.extend(preds.argmax(dim=1).cpu().numpy())
-                y_true.extend(y_batch.cpu().numpy())
+                y_true.extend(labels.cpu().numpy())
 
         val_loss /= len(val_loader)
         acc = accuracy_score(y_true, y_preds)
@@ -131,32 +127,29 @@ def train_model(trial, train_loader, val_loader, device="cpu"):
                 break
 
     if best_model_state:
-        torch.save(best_model_state, f"parameters/best_model_{hidden_size}_{num_layers}_{lr}.pth")
+        torch.save(best_model_state, f"parameters/bert_model_{hidden_size}_{dropout}_{lr}.pth")
 
     return trial_acc
 
 
 def evaluate(param, name_model, test_loader, device="cpu"):
 #   model = LSTM(input_size=40, hidden_size=param["hidden_size"], num_layers=param["num_layers"], bias=True, output_size=4)
-  model = GRU(input_size =40, hidden_size=param["hidden_size"], output_size=4, num_layers=param["num_layers"], bias=True)
-  model.load_state_dict(torch.load(f"parameters/best_model_{param["hidden_size"]}_{param["num_layers"]}_{param["lr"]}.pth"))
+  model = BERTClassifier(hidden_size=param["hidden_size"], dropout=param["dropout"])
+  model.load_state_dict(torch.load(f"parameters/bert_model_{param["hidden_size"]}_{param["dropout"]}_{param["lr"]}.pth"))
   model.eval()
   y_preds, y_true = [], []
   with torch.no_grad():
-    for X_batch, y_batch in test_loader:
-        X_batch, y_batch = X_batch, y_batch
-        X_batch = X_batch.float().unsqueeze(1)
-        y_batch = y_batch.long()            
-        preds = model(X_batch).argmax(dim=1)
+    for data in test_loader:
+        input_ids, attention_mask, labels  = data["input_ids"], data["attention_mask"], data["labels"]            
+        preds = model(input_ids, attention_mask).argmax(dim=1)
         y_preds.extend(preds)
-        y_true.extend(y_batch)
+        y_true.extend(labels)
     cm = confusion_matrix(y_true, y_preds)
     ConfusionMatrixDisplay(cm).plot()
     print("Accuracy: ", accuracy_score(y_true, y_preds))
 
-
 study = optuna.create_study(direction="maximize")
-study.optimize(lambda trial: train_model(trial, train_dataloader, val_dataloader, device="cpu"), n_trials=50)
+study.optimize(lambda trial: train_model(trial, train_dataloader, val_dataloader, device="cpu"), n_trials=5)
 
 print("Best Hyperparameters:", study.best_params)
 evaluate(study.best_params, 'gru', test_dataloader)
